@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import shlex
 import sys
 import webbrowser
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 import colorama
@@ -83,32 +83,34 @@ def main(argv=()):
     ignore_dirs = list(filter(None, ignore_dirs))
     ignore_handler = IgnoreFilter(ignore_dirs, args.re_ignore)
 
-    app = _create_app(
-        watch_dirs, ignore_handler, builder, serve_dir, url_host, args.open_browser
-    )
+    app = _create_app(watch_dirs, ignore_handler, builder, serve_dir, url_host)
 
     if not args.no_initial_build:
         show_message("Starting initial build")
         builder(changed_paths=())
 
     show_message("Waiting to detect changes...")
+    config = uvicorn.Config(app, host=host_name, port=port_num, log_level="warning")
+    server = uvicorn.Server(config)
+
+    async def serve():
+        server_task = asyncio.create_task(server.serve())
+        while not server.started and not server.should_exit:
+            if server_task.done():
+                break
+            await asyncio.sleep(0.1)
+        if args.open_browser and server.started:
+            webbrowser.open(f"http://{url_host}")
+        await server_task
+
     try:
-        uvicorn.run(app, host=host_name, port=port_num, log_level="warning")
+        asyncio.run(serve())
     except KeyboardInterrupt:
         show_message("Server ceasing operations. Cheerio!")
 
 
-def _create_app(
-    watch_dirs, ignore_handler, builder, out_dir, url_host, open_browser=False
-):
+def _create_app(watch_dirs, ignore_handler, builder, out_dir, url_host):
     watcher = RebuildServer(watch_dirs, ignore_handler, change_callback=builder)
-
-    @asynccontextmanager
-    async def lifespan(app):
-        async with watcher.lifespan(app):
-            if open_browser:
-                webbrowser.open(f"http://{url_host}")
-            yield
 
     return Starlette(
         routes=[
@@ -116,7 +118,7 @@ def _create_app(
             Mount("/", app=StaticFiles(directory=out_dir, html=True), name="static"),
         ],
         middleware=[Middleware(JavascriptInjectorMiddleware, ws_url=url_host)],
-        lifespan=lifespan,
+        lifespan=watcher.lifespan,
     )
 
 
